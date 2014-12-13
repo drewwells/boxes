@@ -5,18 +5,35 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"sort"
 	"sync"
 )
 
-func main() {
+var (
+	jbox, jblock         []byte
+	shallowboxes, blocks RubixSlice
+	hideOutput           bool
+)
 
-	jbox, _ := ioutil.ReadFile("boxes.json")
-	jblock, _ := ioutil.ReadFile("blocks.json")
-	var (
-		boxes, blocks RubixSlice
-	)
-	err := json.Unmarshal(jbox, &boxes)
+func init() {
+	resp, err := http.Get("https://s3.amazonaws.com/se-code-challenge/boxes.json")
+	if err != nil {
+		log.Fatal(err)
+	}
+	jbox, err = ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+	resp, err = http.Get("https://s3.amazonaws.com/se-code-challenge/blocks.json")
+	if err != nil {
+		log.Fatal(err)
+	}
+	jblock, err = ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = json.Unmarshal(jbox, &shallowboxes)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -24,11 +41,25 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+}
 
-	sort.Sort(boxes)
+func main() {
+	// Use go test
+	FFD(shallowboxes, blocks)
+}
+
+func FFD(shallowboxes, blocks RubixSlice) {
+
+	// Allocate more space for boxes, since we constantly append to it
+	boxes := make(RubixSlice, len(shallowboxes), len(shallowboxes)*3)
+	copy(boxes, shallowboxes)
+
+	// The input data set has some very large blocks that
+	// only fit in some boxes. Optimizing for the use case
+	// where only one block fits in one type of box.
+	sort.Sort(sort.Reverse(boxes))
 	sort.Sort(sort.Reverse(blocks))
 
-	// Initialize the theoretical average number of boxes per block
 	// This may help keep memory thrashing down.
 	// avgCap := blocks.Len() / boxes.Len()
 	// for i := range boxes {
@@ -37,47 +68,62 @@ func main() {
 
 	for i := range blocks {
 		for j := range boxes {
-			if blocks[i].L < boxes[j].L && blocks[i].H < boxes[j].H && blocks[i].W < boxes[j].W {
-				// Create three new boxes for the remaining space (if any)
+			if blocks[i].H > boxes[j].H {
+				break
+			}
+			if fit(blocks[i], boxes[j]) {
 				boxes[j].Keys = append(boxes[j].Keys, blocks[i].ID())
 				blocks[i].Keys = append(blocks[i].Keys, boxes[j].ID())
 				blocks[i].Stored = true
 
-				// L
-				boxes = append(boxes, Rubix{
-					L:     boxes[j].L - blocks[i].L,
-					W:     boxes[j].W,
-					H:     boxes[j].H,
-					Boxid: boxes[j].Boxid,
-				})
+				// Optimistically load blocks in at the bottom of boxes.
+				// Moving to the next box if a block doesn't fit.
+				// Boxes are continually partitioned after inserting blocks
+				// and sorted by height.
+				insert := []Rubix{Rubix{
+					L: blocks[i].L,
+					W: boxes[j].W - blocks[i].W,
+					H: blocks[i].H,
+				}, Rubix{
+					L: boxes[j].L - blocks[i].L,
+					W: blocks[i].W,
+					H: blocks[i].H,
+				}, Rubix{
+					L: boxes[j].L,
+					W: boxes[j].W,
+					H: boxes[j].H - blocks[i].H,
+				}}
+				// Reorder for maximize space first
+				if (boxes[j].W-blocks[i].W)*boxes[j].L <
+					(boxes[j].L-blocks[i].L)*boxes[j].W {
+					insert[1], insert[0] = insert[0], insert[1]
+				}
 
-				// H
-				boxes = append(boxes, Rubix{
-					L:     blocks[i].L,
-					W:     boxes[j].W,
-					H:     boxes[j].H - blocks[i].H,
-					Boxid: boxes[j].Boxid,
-				})
-
-				// H
-				boxes = append(boxes, Rubix{
-					L:     blocks[i].L,
-					W:     boxes[j].W - blocks[i].W,
-					H:     blocks[i].H,
-					Boxid: boxes[j].Boxid,
-				})
-
-				sort.Sort(boxes)
+				// Maintain sorted state, which is slower for this small
+				// dataset, but should have improvements as the len(boxes)
+				// increases.
+				for i := range insert {
+					pos := boxes.Search(insert[i])
+					boxes = append(boxes[:pos],
+						append([]Rubix{insert[i]}, boxes[pos:]...)...)
+				}
 				break
 			}
 		}
 	}
 
-	// Check if any were missed
+	var missed RubixSlice
 	for i := range blocks {
 		if !blocks[i].Stored {
-			fmt.Println("Could not fit:", blocks[i])
+			missed = append(missed, blocks[i])
 		}
+	}
+	jmiss, _ := json.MarshalIndent(
+		map[string]RubixSlice{
+			fmt.Sprintf("%d blocks did not fit", len(missed)): missed,
+		}, "", "  ")
+	if !hideOutput {
+		fmt.Println(string(jmiss))
 	}
 
 	box := SafeBox{}
@@ -96,15 +142,22 @@ func main() {
 		}
 	}
 
-	r := Response{
+	bs, _ := json.MarshalIndent(Response{
 		Boxmapping:   box.M,
 		Blockmapping: block.M,
+	}, "", "  ")
+	if !hideOutput {
+		fmt.Println(string(bs))
 	}
-	bs, err := json.Marshal(r)
-	if err != nil {
-		log.Fatal(err)
+}
+
+func fit(a, b Rubix) bool {
+	if a.L < b.L &&
+		a.H < b.H &&
+		a.W < b.W {
+		return true
 	}
-	fmt.Println(string(bs))
+	return false
 }
 
 type Response struct {
@@ -132,10 +185,12 @@ type Rubix struct {
 }
 
 func (r Rubix) String() string {
-	if r.Boxid != "" {
-		return fmt.Sprintf("%s: %fx%fx%f", r.ID(), r.H, r.W, r.L)
+	if r.Blockid != "" {
+		return fmt.Sprintf("%s: %f x %f x %f",
+			r.ID(), r.W, r.L, r.H)
 	} else {
-		return fmt.Sprintf("%s: %f Storing: %v", r.ID(), r.Size(), r.Keys)
+		return fmt.Sprintf("%s: %f x %f x %f Storing: %v",
+			r.ID(), r.W, r.L, r.H, r.Keys)
 	}
 }
 
@@ -161,8 +216,15 @@ func (r RubixSlice) Swap(i, j int) {
 }
 
 func (r RubixSlice) Less(i, j int) bool {
-	if r[i].Size() < r[j].Size() {
+	if r[i].H < r[j].H {
 		return true
 	}
 	return false
+}
+
+func (rs RubixSlice) Search(r Rubix) int {
+	pos := sort.Search(len(rs), func(i int) bool {
+		return r.H > rs[i].H
+	})
+	return pos
 }
